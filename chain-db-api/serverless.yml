@@ -1,4 +1,4 @@
-service: serverless-flask
+service: chain-db-api
 
 plugins:
   - serverless-python-requirements
@@ -15,11 +15,12 @@ provider:
   name: aws
   runtime: python3.8
   stage: dev
-  region: us-east-1f
+  region: us-east-1
+  timeout: 60
 
 functions:
   app:
-    handler: wsgi.handler
+    handler: wsgi_handler.handler
     events:
       - http: ANY /
       - http: 'ANY {proxy+}'
