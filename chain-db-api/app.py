@@ -131,7 +131,7 @@ def formatted_hist(func):
                 response_text = ''
                 for k in sorted(result.keys()):
                     response_text += formatter(k, result[k])
-                response = make_response(response_text.rstrip(',\n'))
+                response = make_response(response_text.rstrip(',\n') + '\n')
                 response.headers.set('Content-Type', PLAIN_MIME)
                 return response
             return jsonify({'hist': result})
@@ -356,9 +356,9 @@ def score_summary(score, weights_score, start, end, *args, **kwargs):
 @app.route('/chains/<int:chain_id>/<agg>/<score1_name>,<score2_name>')
 @compressed
 @paginated
-@uses_score_pair(weighted=True, score_type='district')
-def chain_two_district_aggregation_raw(score_pair, weights_score, agg, start,
-                                       end, *args, **kwargs):
+@uses_score_pair(score_type='district')
+def district_pair_aggregation_raw(score_pair, agg, start, end,
+                                  *args, **kwargs):
     if agg in ('shares', 'percents', 'wins', 'ties'):
         return {'data': list(chain(*score_pair.get(start, end, agg)))}
     return abort(404, f'Aggregation {agg} not supported.')
@@ -368,10 +368,10 @@ def chain_two_district_aggregation_raw(score_pair, weights_score, agg, start,
 @formatted_hist
 @paginated
 @uses_score_pair(weighted=True, score_type='district')
-def chain_two_district_aggregation_hist(score_pair, weights_score, agg, start,
-                                        end, resolution, *args, **kwargs):
+def district_pair_aggregation_hist(score_pair, weights_score, agg, start, end,
+                                   resolution, *args, **kwargs):
     if agg in ('shares', 'percents'):
-        return score_pair.sorted_hists(start, end, resolution, agg)
+        return score_pair.sorted_hists(start, end, weights_score, resolution, agg)
     elif agg in ('wins', 'ties'):
         # TODO: arbitrary thresholds here (e.g. "what % of districts had ≥35.7% BVAP/VAP?")
         tie_weight = request.args.get('tie_weight', 0)
@@ -381,14 +381,26 @@ def chain_two_district_aggregation_hist(score_pair, weights_score, agg, start,
             abort(400, "Tie weight must be a float.")
         if not (0 <= tie_weight <= 1):
             abort(400, "Tie weight must be in [0, 1].")
-        return score_pair.threshold_hist(start, end, tie_weight)
+        return score_pair.threshold_hist(start, end, weights_score, tie_weight)
     return abort(404, f'Aggregation {agg} not supported.')
 
 
 @app.route('/chains/<int:chain_id>/<agg>/<score1_name>,<score2_name>/summary')
-@compressed
+@summarized_hist
 @paginated
-def chain_two_district_aggregation_summary(chain_id, agg, score1_name,
-                                           score2_name, start, end,
-                                           resolution):
-    pass
+@uses_score_pair(weighted=True, score_type='district')
+def district_pair_aggregation_summary(score_pair, weights_score, agg, start,
+                                      end, *args, **kwargs):
+    if agg in ('shares', 'percents'):
+        return score_pair.sorted_hists(start, end, weights_score, agg_type=agg)
+    elif agg in ('wins', 'ties'):
+        # TODO: arbitrary thresholds here (e.g. "what % of districts had ≥35.7% BVAP/VAP?")
+        tie_weight = request.args.get('tie_weight', 0)
+        try:
+            tie_weight = float(tie_weight)
+        except ValueError:
+            abort(400, "Tie weight must be a float.")
+        if not (0 <= tie_weight <= 1):
+            abort(400, "Tie weight must be in [0, 1].")
+        return score_pair.threshold_hist(start, end, weights_score, tie_weight)
+    return abort(404, f'Aggregation {agg} not supported.')

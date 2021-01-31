@@ -355,9 +355,9 @@ class DistrictScorePair(Pair):
         return hists
 
     def threshold_hist(self,
-                       weights_score: Optional[PlanScore] = None,
                        start: int = 1,
                        end: Optional[int] = None,
+                       weights_score: Optional[PlanScore] = None,
                        tie_weight: float = 0) -> Dict[float, float]:
         hist = defaultdict(int)
         curr_wins = np.zeros(self.n_districts, dtype=bool)
