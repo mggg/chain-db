@@ -1,10 +1,10 @@
 """Complex queries (roughly >2 lines) for score aggregation, etc."""
 import os
 import numpy as np
-from typing import Optional, Dict, List, Generator
 from collections import defaultdict
-from psycopg2.extensions import connection
-from psycopg2.sql import SQL
+from typing import Optional, Dict, List, Generator, Union, Tuple
+from psycopg2.sql import SQL, Literal
+from psycopg2.extensions import connection, cursor
 
 MAX_STEPS = int(1e5)
 AGG_TYPES = {
@@ -22,14 +22,44 @@ TWO_SCORE_AGG_TYPES = {
     'ties': 's1.score = s2.score'
 }
 
-QUERIES = {
-    
-}
+
+def load_queries() -> Dict[str, SQL]:
+    queries_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'queries')
+    queries = {}
+    for file in os.listdir(queries_dir):
+        if file.endswith('.sql'):
+            query_name = file[:-4]
+            with open(os.path.join(queries_dir, file)) as f:
+                queries[query_name] = SQL(f.read())
+    return queries
+
+
+queries = load_queries()
 
 
 def uniform_weights() -> Generator[List[int], None, None]:
     while True:
         yield [1] * MAX_STEPS
+
+
+def query_blocks(start: int,
+                 end: int) -> Generator[Tuple[int, int], None, None]:
+    block_start = start
+    if end is None:
+        block_end = start + MAX_STEPS
+    else:
+        block_end = min(start + MAX_STEPS, end)
+    yield block_start, block_end
+
+    while True:
+        old_end = block_end
+        block_start = old_end
+        if end is None:
+            block_end = old_end + MAX_STEPS
+        else:
+            block_end = min(end, old_end + MAX_STEPS)
+        yield block_start, block_end
 
 
 def to_res(val: float, resolution: Optional[float]) -> float:
@@ -38,9 +68,47 @@ def to_res(val: float, resolution: Optional[float]) -> float:
     return resolution * round(val / resolution)
 
 
+def get_chain_meta(db: connection, chain_id: int) -> Optional[Dict]:
+    cursor = db.cursor()
+    cursor.execute('SELECT * FROM chain_meta WHERE id = %s', [chain_id])
+    chain_record = cursor.fetchone()
+    if chain_record is None:
+        return None
+
+    cursor.execute('SELECT * FROM scores WHERE batch_id = %s',
+                   [chain_record.batch_id])
+    scores = [{
+        k: v
+        for k, v in row._asdict().items() if k != 'batch_id' and v is not None
+    } for row in cursor.fetchall()]
+
+    return {**chain_record._asdict(), 'scores': scores}
+
+
+def get_snapshot(db: connection, chain_id: int,
+                 step: int) -> Optional[Dict[str, List]]:
+    cursor = db.cursor()
+    cursor.execute(queries['snapshot'], {'chain_id': chain_id, 'step': step})
+    snapshot = cursor.fetchone()
+    if snapshot is None:
+        return None
+    return snapshot._asdict()
+
+
+def get_snapshots(db: connection, chain_id: int, start: int,
+                  end: Optional[int]) -> Dict[str, List]:
+    cursor = db.cursor()
+    cursor.execute(queries['snapshots'], {
+        'chain_id': chain_id,
+        'start': start,
+        'end': end
+    })
+    return [row._asdict() for row in cursor.fetchall()]
+
+
 # TODO: proper error handling (what if two scores don't belong to the same chain)
-def get_score(db: connection, chain_id: int,
-              score_name: str) -> Dict[str, Dict]:
+def get_score_meta(db: connection, chain_id: int,
+                   score_name: str) -> Optional[Dict]:
     cursor = db.cursor()
     cursor.execute('SELECT batch_id FROM chain_meta WHERE id=%s', [chain_id])
     chain_res = cursor.fetchone()
@@ -49,410 +117,286 @@ def get_score(db: connection, chain_id: int,
 
     cursor.execute('SELECT * FROM scores WHERE name=%s AND batch_id=%s',
                    [score_name, chain_res.batch_id])
-    score_res = cursor.fetchone()
-    if score_res is None:
-        return f'Score {score_name} not found in chain {chain_id}.'
-    return {
-        k: v
-        for k, v in score_res._asdict().items()
-        if k != 'batch_id' and v is not None
-    }
+    res = cursor.fetchone()
+    if res is None:
+        return None
+    return res._asdict()
 
 
-def district_scores_at_step(db: connection, chain_id: int, score_id: int,
-                            step: int) -> Dict[int, float]:
+def get_score(db: connection, chain_id: int,
+              score_name: str) -> Optional['Score']:
+    meta = get_score_meta(db, chain_id, score_name)
     cursor = db.cursor()
-    cursor.execute(
-        """SELECT DISTINCT ON (district) district, score FROM district_scores
-        WHERE chain_id=%s AND
-        step <= %s AND
-        score_id=%s
-        ORDER BY district, step DESC""", [chain_id, step, score_id])
-    return {row.district: row.score for row in cursor.fetchall()}
+    if meta is None:
+        return None
+    elif meta['score_type'] == 'plan':
+        return PlanScore(cursor, score_name, meta['id'], chain_id)
+    return DistrictScore(cursor, score_name, meta['id'], chain_id)
 
 
-def two_district_score_aggregation_at_step(
-        db: connection,
-        chain_id: int,
-        score1_id: int,
-        score2_id: int,
-        step: int,
-        agg_type: str = 'shares') -> Dict[int, float]:
-    cursor = db.cursor()
-    assert agg_type in TWO_SCORE_AGG_TYPES  # TODO: real error
-    cursor.execute(
-        f"""SELECT s1.district, {TWO_SCORE_AGG_TYPES[agg_type]} AS score
-        (SELECT DISTINCT ON (district) district, score AS score1 FROM district_scores
-        WHERE chain_id=%s AND
-        step <= %s AND
-        score_id=%s
-        ORDER BY district, step DESC) s1
-        INNER JOIN
-        (SELECT DISTINCT ON (district) district, score AS score2 FROM district_scores
-        WHERE chain_id=%s AND
-        step <= %s AND
-        score_id=%s
-        ORDER BY district, step DESC) s2
-        ON s1.district = s2.district
-        """, (chain_id, step, score1_id, chain_id, step, score2_id))
-    return {row.district: row.score for row in cursor.fetchall()}
+class Score:
+    def __init__(self, cursor: cursor, name: str, score_id: int,
+                 chain_id: int):
+        self.cur = cursor
+        self.name = name
+        self.id = score_id
+        self.chain_id = chain_id
 
 
-def district_scores_at_step(db: connection, chain_id: int, score_id: int,
-                            step: int) -> Dict[int, float]:
-    cursor = db.cursor()
-    cursor.execute(
-        """SELECT DISTINCT ON (district) district, score FROM district_scores
-        WHERE chain_id=%s AND
-        step <= %s AND
-        score_id=%s
-        ORDER BY district, step DESC""", [chain_id, step, score_id])
-    return {row.district: row.score for row in cursor.fetchall()}
+class PlanScore(Score):
+    def get(self,
+            start: int = 1,
+            end: Optional[int] = None) -> Generator[List[int], None, None]:
+        for block_start, block_end in query_blocks(start, end):
+            self.cur.execute(
+                queries['plan_score_data'], {
+                    'chain_id': self.chain_id,
+                    'score_id': self.id,
+                    'start': block_start,
+                    'end': block_end
+                })
+            res = [row.score for row in self.cur.fetchall()]
+            if not res:
+                break
+            yield res
 
-
-def get_plan_score_data(
-        db: connection,
-        chain_id: int,
-        score_id: str,
-        start: int = 1,
-        end: Optional[int] = None) -> Generator[List[int], None, None]:
-    cursor = db.cursor()
-    curr_start = start
-    if end is None:
-        curr_end = MAX_STEPS
-    else:
-        curr_end = min(MAX_STEPS, end)
-    query = SQL("""SELECT score FROM plan_scores WHERE
-        chain_id = %s AND score_id = %s AND step >= %s AND step < %s
-        ORDER BY step ASC""")
-
-    cursor.execute(query, [chain_id, score_id, curr_start, curr_end])
-    res = [row.score for row in cursor.fetchall()]
-    yield res
-    while res:
-        old_end = curr_end
-        curr_start = old_end
-        if end is None:
-            curr_end = old_end + MAX_STEPS
-        else:
-            curr_end = min(end, old_end + MAX_STEPS)
-        cursor.execute(query, [chain_id, score_id, curr_start, curr_end])
-        res = [row.score for row in cursor.fetchall()]
-        yield res
-
-
-def get_district_score_data(
-        db: connection,
-        chain_id: int,
-        score_id: int,
-        start: int = 1,
-        end: Optional[int] = None) -> Generator[List[int], None, None]:
-    cursor = db.cursor()
-    curr_start = start
-    if end is None:
-        curr_end = MAX_STEPS
-    else:
-        curr_end = min(MAX_STEPS, end)
-    query = SQL("""SELECT step, district, score FROM district_scores WHERE
-        chain_id = %s AND score_id = %s AND step >= %s AND step < %s
-        ORDER BY step ASC""")
-
-    cursor.execute(query, (chain_id, score_id, curr_start, curr_end))
-    rows = cursor.fetchall()
-    if not rows:
-        yield []
-
-    while rows:
-        data = []
-        step_data = {}
-        step = rows[0].step
-        for row in rows:
-            if row.step == step:
-                step_data[row.district] = row.score
+    def hist(self,
+             start: int = 1,
+             end: Optional[int] = None,
+             weights_score: Optional['PlanScore'] = None,
+             resolution: Optional[float] = None) -> Dict[float, float]:
+        base_params = {
+            'chain_id': self.chain_id,
+            'score_id': self.id,
+            'start': start,
+            'end': end
+        }
+        if weights_score:
+            # TODO: figure out the right dynamic SQL trickery to clean this up.
+            if resolution is None:
+                self.cur.execute(
+                    queries['plan_score_hist_weighted'], {
+                        **base_params,
+                        'weights_score_id': weights_score.id,
+                    })
             else:
-                data.append(step_data)
-                step_data = {row.district: row.score}
-                step = row.step
-        yield data
-
-        old_end = curr_end
-        curr_start = old_end
-        if end is None:
-            curr_end = old_end + MAX_STEPS
+                self.cur.execute(
+                    queries['plan_score_hist_weighted_resolution'], {
+                        **base_params, 'weights_score_id': weights_score.id,
+                        'resolution': resolution
+                    })
         else:
-            curr_end = min(end, old_end + MAX_STEPS)
-        cursor.execute(query, [chain_id, score_id, curr_start, curr_end])
-        rows = cursor.fetchall()
-
-
-def get_two_district_score_aggregation_data(
-        db: connection,
-        chain_id: int,
-        score1_id: int,
-        score2_id: int,
-        start: int = 1,
-        end: Optional[int] = None,
-        agg_type: str = 'shares') -> Generator[List, None, None]:
-    cursor = db.cursor()
-    curr_start = start
-    if end is None:
-        curr_end = MAX_STEPS
-    else:
-        curr_end = min(MAX_STEPS, end)
-
-    assert agg_type in TWO_SCORE_AGG_TYPES  # TODO: real error!
-    query = SQL(
-        f"""SELECT s1.step, s1.district,
-        {TWO_SCORE_AGG_TYPES[agg_type]} AS score
-        FROM district_scores s1 
-        INNER JOIN district_scores s2 ON 
-        s1.step=s2.step AND s1.district=s2.district AND
-        s2.score_id=%s AND s2.chain_id=%s
-        WHERE s1.score_id=%s AND s1.chain_id=%s
-        AND s1.step >= %s AND s1.step < %s"""
-    )
-    cursor.execute(
-        query,
-        (score2_id, chain_id, score1_id, chain_id, curr_start, curr_end)
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        yield []
-
-    while rows:
-        data = []
-        step_data = {}
-        step = rows[0].step
-        for row in rows:
-            if row.step == step:
-                step_data[row.district] = row.score
+            if resolution is None:
+                self.cur.execute(queries['plan_score_hist_unweighted'],
+                                 base_params)
             else:
-                data.append(step_data)
-                step_data = {row.district: row.score}
-                step = row.step
-        yield data
-
-        old_end = curr_end
-        curr_start = old_end
-        if end is None:
-            curr_end = old_end + MAX_STEPS
-        else:
-            curr_end = min(end, old_end + MAX_STEPS)
-        cursor.execute(
-            query,
-            (score2_id, chain_id, score1_id, chain_id, curr_start, curr_end)
-        )
-        rows = cursor.fetchall()
+                self.cur.execute(
+                    queries['plan_score_hist_unweighted_resolution'], {
+                        **base_params, 'resolution': resolution
+                    })
+        return {row.score: row.weight for row in self.cur.fetchall()}
 
 
-def plan_score_hist(db: connection,
-                    chain_id: int,
-                    score_id: int,
-                    weights_score_id: Optional[int] = None,
-                    start: int = 1,
-                    end: Optional[int] = None,
-                    resolution: Optional[float] = None) -> Dict[float, float]:
-    cursor = db.cursor()
+class DistrictScore(Score):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cur.execute("SELECT districts FROM chain_meta WHERE id=%s",
+                         [self.chain_id])
+        self.n_districts = self.cur.fetchone().districts
 
-    if weights_score_id:
-        # TODO: figure out the right dynamic SQL trickery to clean this up.
-        if resolution is None:
-            cursor.execute(
-                """SELECT
-                s.score,
-                sum(w.score) AS weight
-            FROM
-                plan_scores s
-                INNER JOIN plan_scores w ON s.step = w.step
-                AND w.score_id = %(weights_score_id)s
-                AND w.chain_id = %(chain_id)s
-            WHERE
-                s.score_id = %(score_id)s
-                AND s.chain_id = %(chain_id)s
-                AND s.step >= %(start)s
-                AND (%(end)s IS NULL
-                OR s.step < %(end)s
-            )
-            GROUP BY
-                s.score""",
-            {'weights_score_id': weights_score_id, 'chain_id': chain_id, 'score_id': score_id, 'start': start, 'end': end}
-            )
-        else:
-            cursor.execute(
-                """SELECT score, sum(weight_score) AS weight FROM
-                (SELECT step, score AS weight_score FROM plan_scores
-                WHERE score_id=%s AND chain_id=%s AND step >= %s AND
-                (%s IS NULL OR step < %s)) w
-                INNER JOIN
-                (SELECT step, %s * ROUND(score / %s) AS score FROM plan_scores
-                WHERE score_id=%s AND chain_id=%s AND step >= %s AND
-                (%s IS NULL OR step < %s)) s
-                ON s.step = w.step GROUP BY score""", [
-                    weights_score_id, chain_id, start, end, end, resolution,
-                    resolution, score_id, chain_id, start, end, end
-                ])
-    else:
-        if resolution is None:
-            cursor.execute(
-                """SELECT score, count(score) AS weight FROM plan_scores
-                WHERE score_id=%s AND chain_id=%s AND step >= %s AND
-                (%s IS NULL OR step < %s)
-                GROUP BY score""", [score_id, chain_id, start, end, end])
-        else:
-            cursor.execute(
-                """SELECT %s * ROUND(score / %s) AS score, COUNT(*) AS weight
-                FROM plan_scores
-                WHERE score_id=%s AND chain_id=%s AND step >= %s AND
-                (%s IS NULL OR step < %s)
-                GROUP BY 1""",
-                [resolution, resolution, score_id, chain_id, start, end, end])
-    return {row.score: row.weight for row in cursor.fetchall()}
+    def at_step(self, step: int) -> Dict[int, float]:
+        self.cur.execute(queries['district_scores_at_step'], {
+            'chain_id': self.chain_id,
+            'score_id': self.id,
+            'step': step
+        })
+        return {row.district: row.score for row in self.cur.fetchall()}
 
+    def get(self,
+            start: int = 1,
+            end: Optional[int] = None) -> Generator[List[int], None, None]:
+        for block_start, block_end in query_blocks(start, end):
+            self.cur.execute(
+                queries['district_score_data'], {
+                    'chain_id': self.chain_id,
+                    'score_id': self.id,
+                    'start': block_start,
+                    'end': block_end
+                })
+            rows = self.cur.fetchall()
+            if not rows:
+                break
 
-# TODO:
-#   * Load shares directly from database via self-join query.
-#     Create a generator function similar to those above for scores.
-#   * Create query functions for raw scores and wins (based on existing hist functions)
-#   * Refactor histogram code to use query functions
+            data = []
+            step_data = {}
+            step = rows[0].step
+            for row in rows:
+                if row.step == step:
+                    step_data[row.district] = row.score
+                else:
+                    data.append(step_data)
+                    step_data = {row.district: row.score}
+                    step = row.step
+            yield data
 
-
-def district_score_sorted_hists(
-        db: connection,
-        chain_id: int,
-        score_id: int,
-        weights_score_id: Optional[int] = None,
-        start: int = 1,
-        end: Optional[int] = None,
-        resolution: Optional[float] = None) -> List[Dict[float, float]]:
-    cursor = db.cursor()
-    cursor.execute("SELECT districts FROM chain_meta WHERE id=%s", [chain_id])
-    n_districts = cursor.fetchone().districts
-
-    hists = [defaultdict(int) for _ in range(n_districts)]
-    curr_stats = [0] * n_districts
-    if start > 1:
-        # TODO: verify that all districts have values, e.gt
-        # assert len(scores_at_step) == n_districts but with a
-        # real exception.
-        for k, v in district_scores_at_step(db, chain_id, score_id, start):
-            curr_stats[k - 1] = to_res(v, resolution)
-
-    if weights_score_id:
-        weights = get_plan_score_data(db, chain_id, weights_score_id, start,
-                                      end)
-    else:
-        weights = uniform_weights()
-    vals = get_district_score_data(db, chain_id, score_id, start, end)
-    for vals_block, weight_block in zip(vals, weights):
-        for vals, weight in zip(vals_block, weight_block):
-            for dist, val in vals.items():
-                # TODO: map arbitrary district IDs.
-                curr_stats[dist - 1] = to_res(val, resolution)
-            for i, val in enumerate(sorted(curr_stats)):
-                hists[i][val] += weight
-    return hists
-
-
-def two_district_score_sorted_hists(
-        db: connection,
-        chain_id: int,
-        score1_id: int,
-        score2_id: int,
-        weights_score_id: Optional[int] = None,
-        start: int = 1,
-        end: Optional[int] = None,
-        resolution: Optional[float] = None,
-        agg_type: str = 'shares') -> List[Dict[float, float]]:
-    cursor = db.cursor()
-    cursor.execute("SELECT districts FROM chain_meta WHERE id=%s", [chain_id])
-    n_districts = cursor.fetchone().districts
-
-    hists = [defaultdict(int) for _ in range(n_districts)]
-    curr_agg = np.zeros(n_districts)
-    if start > 1:
-        at_step = two_district_score_aggregation_at_step(
-            db, chain_id, score1_id, score2_id, start, agg_type)
-        for k, v in at_step.items():
-            # TODO: check that all districts are received.
-            curr_agg[k] = to_res(v, resolution)
-
-    if weights_score_id:
-        weights = get_plan_score_data(db, chain_id, weights_score_id, start,
-                                      end)
-    else:
-        weights = uniform_weights()
-    for agg_block, weight_block in zip(
-            get_two_district_score_aggregation_data(db, chain_id, score1_id,
-                                                    score2_id, start, end, agg_type),
-            weights):
-        for vals, weight in zip(agg_block, weight_block):
-            for dist, val in vals.items():
-                # TODO: map arbitrary district IDs.
-                curr_agg[dist - 1] = to_res(val, resolution)
-            for i, val in enumerate(np.sort(curr_agg)):
-                hists[i][float(val)] += weight
-    return hists
-
-
-def two_district_score_threshold_hist(
-        db: connection,
-        chain_id: int,
-        score1_id: int,
-        score2_id: int,
-        weights_score_id: Optional[int] = None,
-        start: int = 1,
-        end: Optional[int] = None,
-        tie_weight: float = 0) -> Dict[float, float]:
-    cursor = db.cursor()
-    cursor.execute("SELECT districts FROM chain_meta WHERE id=%s", [chain_id])
-    n_districts = cursor.fetchone().districts
-
-    hist = defaultdict(int)
-    curr_wins = np.zeros(n_districts, dtype=bool)
-    if start > 1:
-        wins_at_step = two_district_score_aggregation_at_step(
-            db, chain_id, score1_id, score2_id, start, 'wins')
-        for k, v in wins_at_step.items():
-            # TODO: check that all districts are received.
-            curr_wins[k] = v
-
-    if weights_score_id:
-        weights = get_plan_score_data(db, chain_id, weights_score_id, start,
-                                      end)
-    else:
-        weights = uniform_weights()
-
-    if tie_weight > 0:
-        curr_ties = np.zeros(n_districts, dtype=bool)
+    def sorted_hists(
+            self,
+            start: int = 1,
+            end: Optional[int] = None,
+            weights_score: Optional[PlanScore] = None,
+            resolution: Optional[float] = None) -> List[Dict[float, float]]:
+        hists = [defaultdict(int) for _ in range(self.n_districts)]
+        curr_stats = [0] * self.n_districts
         if start > 1:
-            ties_at_step = two_district_score_aggregation_at_step(
-                db, chain_id, score1_id, score2_id, start, 'ties')
-            for k, v in ties_at_step.items():
-                # TODO: check that all districts are received.
-                curr_ties[k] = v
+            # TODO: verify that all districts have values, e.gt
+            # assert len(scores_at_step) == n_districts but with a
+            # real exception.
+            for k, v in self.at_step(start):
+                curr_stats[k - 1] = to_res(v, resolution)
 
-        for wins_block, ties_block, weight_block in zip(
-                get_two_district_score_aggregation_data(
-                    db, chain_id, score1_id, score2_id, start, end, 'wins'),
-                get_two_district_score_aggregation_data(
-                    db, chain_id, score1_id, score2_id, start, end, 'ties'),
-                weights):
-            for wins, ties, weight in zip(wins_block, ties_block,
-                                          weight_block):
-                for dist, val in wins.items():
-                    curr_wins[dist - 1] = val
-                for dist, val in ties.items():
-                    curr_ties[dist - 1] = val
-                n_wins = int(curr_wins.sum())
-                n_ties = int(curr_ties.sum())
-                hist[n_wins + (tie_weight * n_ties)] += weight
-    else:
-        for wins_block, weight_block in zip(
-                get_two_district_score_aggregation_data(
-                    db, chain_id, score1_id, score2_id, start, end, 'wins'),
-                weights):
-            for wins, weight in zip(wins_block, weight_block):
-                for dist, val in wins.items():
-                    curr_wins[dist - 1] = val
-                hist[int(curr_wins.sum())] += weight
-    return hist
+        if weights_score:
+            weights = weights_score.get(start, end)
+        else:
+            weights = uniform_weights()
+        vals = self.get(start, end)
+        for vals_block, weight_block in zip(vals, weights):
+            for vals, weight in zip(vals_block, weight_block):
+                for dist, val in vals.items():
+                    # TODO: map arbitrary district IDs.
+                    curr_stats[dist - 1] = to_res(val, resolution)
+                for i, val in enumerate(sorted(curr_stats)):
+                    hists[i][val] += weight
+        return hists
+
+
+class Pair:
+    """A pair of scores."""
+
+
+class DistrictScorePair(Pair):
+    def __init__(self, score1: DistrictScore, score2: DistrictScore):
+        self.score1 = score1
+        self.score2 = score2
+        assert self.score1.chain_id == self.score2.chain_id  # TODO: real error
+        self.cur = self.score1.cur
+        self.chain_id = self.score1.chain_id
+        self.n_districts = self.score1.n_districts
+
+    def at_step(self, step: int, agg_type: str = 'shares') -> Dict[int, float]:
+        assert agg_type in TWO_SCORE_AGG_TYPES  # TODO: real error
+        self.cur.execute(
+            queries['district_score_pair_aggregation_at_step'].format(
+                SQL(TWO_SCORE_AGG_TYPES[agg_type]), {
+                    'chain_id': self.chain_id,
+                    'score1_id': self.score1.id,
+                    'score2_id': self.score2.id,
+                    'step': step
+                }))
+        return {row.district: row.score for row in cursor.fetchall()}
+
+    def get(self,
+            start: int = 1,
+            end: Optional[int] = None,
+            agg_type: str = 'shares') -> Generator[List, None, None]:
+        assert agg_type in TWO_SCORE_AGG_TYPES  # TODO: real error!
+        query = queries['district_score_pair_aggregation_data'].format(
+            SQL(TWO_SCORE_AGG_TYPES[agg_type]))
+
+        for block_start, block_end in query_blocks(start, end):
+            self.cur.execute(
+                query, {
+                    'score1_id': self.score1.id,
+                    'score2_id': self.score2.id,
+                    'chain_id': self.chain_id,
+                    'start': block_start,
+                    'end': block_end
+                })
+            rows = self.cur.fetchall()
+            if not rows:
+                break
+
+            data = []
+            step_data = {}
+            step = rows[0].step
+            for row in rows:
+                if row.step == step:
+                    step_data[row.district] = row.score
+                else:
+                    data.append(step_data)
+                    step_data = {row.district: row.score}
+                    step = row.step
+            yield data
+
+    def sorted_hists(self,
+                     start: int = 1,
+                     end: Optional[int] = None,
+                     weights_score: Optional[PlanScore] = None,
+                     resolution: Optional[float] = None,
+                     agg_type: str = 'shares') -> List[Dict[float, float]]:
+        hists = [defaultdict(int) for _ in range(self.n_districts)]
+        curr_agg = np.zeros(self.n_districts)
+        if start > 1:
+            for k, v in self.at_step(start, agg_type).items():
+                # TODO: check that all districts are received.
+                curr_agg[k] = to_res(v, resolution)
+
+        if weights_score:
+            weights = weights_score.get(start, end)
+        else:
+            weights = uniform_weights()
+        for agg_block, weight_block in zip(self.get(start, end, agg_type),
+                                           weights):
+            for vals, weight in zip(agg_block, weight_block):
+                for dist, val in vals.items():
+                    # TODO: map arbitrary district IDs.
+                    curr_agg[dist - 1] = to_res(val, resolution)
+                for i, val in enumerate(np.sort(curr_agg)):
+                    hists[i][float(val)] += weight
+        return hists
+
+    def threshold_hist(self,
+                       weights_score: Optional[PlanScore] = None,
+                       start: int = 1,
+                       end: Optional[int] = None,
+                       tie_weight: float = 0) -> Dict[float, float]:
+        hist = defaultdict(int)
+        curr_wins = np.zeros(self.n_districts, dtype=bool)
+        if start > 1:
+            wins_at_step = self.at_step(start, 'wins')
+            for k, v in wins_at_step.items():
+                # TODO: check that all districts are received.
+                curr_wins[k] = v
+
+        if weights_score:
+            weights = weights_score.get(start, end)
+        else:
+            weights = uniform_weights()
+
+        if tie_weight > 0:
+            curr_ties = np.zeros(self.n_districts, dtype=bool)
+            if start > 1:
+                ties_at_step = self.at_step(start, 'ties')
+                for k, v in ties_at_step.items():
+                    # TODO: check that all districts are received.
+                    curr_ties[k] = v
+
+            for wins_block, ties_block, weight_block in zip(
+                    self.get(start, end, 'wins'), self.get(start, end, 'ties'),
+                    weights):
+                for wins, ties, weight in zip(wins_block, ties_block,
+                                              weight_block):
+                    for dist, val in wins.items():
+                        curr_wins[dist - 1] = val
+                    for dist, val in ties.items():
+                        curr_ties[dist - 1] = val
+                    n_wins = int(curr_wins.sum())
+                    n_ties = int(curr_ties.sum())
+                    hist[n_wins + (tie_weight * n_ties)] += weight
+        else:
+            for wins_block, weight_block in zip(self.get(start, end, 'wins'),
+                                                weights):
+                for wins, weight in zip(wins_block, weight_block):
+                    for dist, val in wins.items():
+                        curr_wins[dist - 1] = val
+                    hist[int(curr_wins.sum())] += weight
+        return hist

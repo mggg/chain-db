@@ -4,7 +4,7 @@ sum(w.score) AS weight
 FROM
     plan_scores s
     INNER JOIN plan_scores w ON s.step = w.step
-        AND w.score_id = %(weight_score_id)s
+        AND w.score_id = %(weights_score_id)s
         AND w.chain_id = %(chain_id)s
 WHERE
     s.score_id = %(score_id)s
