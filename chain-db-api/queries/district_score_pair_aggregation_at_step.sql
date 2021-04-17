@@ -3,7 +3,7 @@ SELECT
     {} AS score
 FROM ( SELECT DISTINCT ON (district)
         district,
-        score AS score1
+        score 
     FROM
         district_scores
     WHERE
@@ -15,7 +15,7 @@ FROM ( SELECT DISTINCT ON (district)
         step DESC) s1
     INNER JOIN ( SELECT DISTINCT ON (district)
             district,
-            score AS score2
+            score
         FROM
             district_scores
         WHERE

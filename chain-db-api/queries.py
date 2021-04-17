@@ -286,13 +286,13 @@ class DistrictScorePair(Pair):
         assert agg_type in TWO_SCORE_AGG_TYPES  # TODO: real error
         self.cur.execute(
             queries['district_score_pair_aggregation_at_step'].format(
-                SQL(TWO_SCORE_AGG_TYPES[agg_type]), {
+                SQL(TWO_SCORE_AGG_TYPES[agg_type])), {
                     'chain_id': self.chain_id,
                     'score1_id': self.score1.id,
                     'score2_id': self.score2.id,
                     'step': step
-                }))
-        return {row.district: row.score for row in cursor.fetchall()}
+                })
+        return {row.district: row.score for row in self.cur.fetchall()}
 
     def get(self,
             start: int = 1,
@@ -338,7 +338,7 @@ class DistrictScorePair(Pair):
         if start > 1:
             for k, v in self.at_step(start, agg_type).items():
                 # TODO: check that all districts are received.
-                curr_agg[k] = to_res(v, resolution)
+                curr_agg[k - 1] = to_res(v, resolution)
 
         if weights_score:
             weights = weights_score.get(start, end)
